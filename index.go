@@ -2,6 +2,7 @@ package event_nats
 
 import (
 	"github.com/infrago/event"
+	"github.com/infrago/infra"
 )
 
 func Driver() event.Driver {
@@ -12,8 +13,9 @@ func JsDriver() event.Driver {
 }
 
 func init() {
+	infra.Register("nats", Driver())
+
 	jsd := JsDriver()
-	event.Register("nats", Driver())
-	event.Register("natsjs", jsd)
-	event.Register("nats-js", jsd)
+	infra.Register("natsjs", jsd)
+	infra.Register("nats-js", jsd)
 }
