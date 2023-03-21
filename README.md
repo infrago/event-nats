@@ -1,2 +1,2 @@
 # event-nats
-infra.go nats event driver.
+infra.Go nats event driver.
