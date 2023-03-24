@@ -197,7 +197,7 @@ func (this *natsjsConnect) Stop() error {
 	return nil
 }
 
-func (this *natsjsConnect) Notify(name string, data []byte) error {
+func (this *natsjsConnect) Publish(name string, data []byte) error {
 	if this.client == nil {
 		return errInvalidConnection
 	}

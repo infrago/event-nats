@@ -161,7 +161,7 @@ func (this *natsConnect) Stop() error {
 	return nil
 }
 
-func (this *natsConnect) Notify(name string, data []byte) error {
+func (this *natsConnect) Publish(name string, data []byte) error {
 	if this.client == nil {
 		return errInvalidConnection
 	}
