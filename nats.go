@@ -50,20 +50,23 @@ func (driver *natsDriver) Connect(inst *event.Instance) (event.Connect, error) {
 		Url: nats.DefaultURL, Username: "", Password: "",
 	}
 
-	if vv, ok := inst.Config.Setting["url"].(string); ok {
+	if vv, ok := inst.Setting["url"].(string); ok {
+		setting.Url = vv
+	}
+	if vv, ok := inst.Setting["server"].(string); ok {
 		setting.Url = vv
 	}
 
-	if vv, ok := inst.Config.Setting["user"].(string); ok {
+	if vv, ok := inst.Setting["user"].(string); ok {
 		setting.Username = vv
 	}
-	if vv, ok := inst.Config.Setting["username"].(string); ok {
+	if vv, ok := inst.Setting["username"].(string); ok {
 		setting.Username = vv
 	}
-	if vv, ok := inst.Config.Setting["pass"].(string); ok {
+	if vv, ok := inst.Setting["pass"].(string); ok {
 		setting.Password = vv
 	}
-	if vv, ok := inst.Config.Setting["password"].(string); ok {
+	if vv, ok := inst.Setting["password"].(string); ok {
 		setting.Password = vv
 	}
 
