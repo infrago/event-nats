@@ -2,6 +2,7 @@ package event_nats
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/infrago/event"
@@ -33,6 +34,7 @@ type (
 	//配置文件
 	natsSetting struct {
 		Url      string
+		Token    string
 		Username string
 		Password string
 	}
@@ -57,6 +59,10 @@ func (driver *natsDriver) Connect(inst *event.Instance) (event.Connect, error) {
 		setting.Url = vv
 	}
 
+	if vv, ok := inst.Setting["token"].(string); ok {
+		setting.Token = vv
+	}
+
 	if vv, ok := inst.Setting["user"].(string); ok {
 		setting.Username = vv
 	}
@@ -70,6 +76,8 @@ func (driver *natsDriver) Connect(inst *event.Instance) (event.Connect, error) {
 		setting.Password = vv
 	}
 
+	fmt.Println("nats", inst.Setting, setting)
+
 	return &natsConnect{
 		instance: inst, setting: setting,
 		events: make(map[string]string, 0),
@@ -80,6 +88,10 @@ func (driver *natsDriver) Connect(inst *event.Instance) (event.Connect, error) {
 // 打开连接
 func (this *natsConnect) Open() error {
 	opts := []nats.Option{}
+
+	if this.setting.Token != "" {
+		opts = append(opts, nats.Token(this.setting.Token))
+	}
 	if this.setting.Username != "" && this.setting.Password != "" {
 		opts = append(opts, nats.UserInfo(this.setting.Username, this.setting.Password))
 	}
