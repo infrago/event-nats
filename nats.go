@@ -2,7 +2,6 @@ package event_nats
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 
 	"github.com/infrago/event"
@@ -75,8 +74,6 @@ func (driver *natsDriver) Connect(inst *event.Instance) (event.Connect, error) {
 	if vv, ok := inst.Setting["password"].(string); ok {
 		setting.Password = vv
 	}
-
-	fmt.Println("nats", inst.Setting, setting)
 
 	return &natsConnect{
 		instance: inst, setting: setting,
