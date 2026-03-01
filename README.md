@@ -1,2 +1,2 @@
 # event-nats
-bamgoo nats event driver.
+infrago nats event driver.

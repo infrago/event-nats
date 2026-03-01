@@ -5,17 +5,17 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bamgoo/bamgoo"
-	"github.com/bamgoo/event"
+	"github.com/infrago/infra"
+	"github.com/infrago/event"
 	"github.com/nats-io/nats.go"
 )
 
 func init() {
-	bamgoo.Register("nats", &natsDriver{})
+	infra.Register("nats", &natsDriver{})
 	js := &natsJSDriver{}
-	bamgoo.Register("natsjs", js)
-	bamgoo.Register("nats-js", js)
-	bamgoo.Register("jetstream", js)
+	infra.Register("natsjs", js)
+	infra.Register("nats-js", js)
+	infra.Register("jetstream", js)
 }
 
 type (
@@ -58,7 +58,7 @@ func parseSetting(inst *event.Instance) natsSetting {
 	cfg := inst.Config.Setting
 	setting := natsSetting{
 		URL:    nats.DefaultURL,
-		Stream: "BAMGOOE",
+		Stream: "INFRAGOE",
 	}
 
 	if v, ok := cfg["url"].(string); ok && v != "" {
