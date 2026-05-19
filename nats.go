@@ -1,13 +1,25 @@
 package event_nats
 
 import (
+	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/infrago/infra"
 	"github.com/infrago/event"
+	"github.com/infrago/infra"
 	"github.com/nats-io/nats.go"
+)
+
+const (
+	natsDefaultTimeout    = 5 * time.Second
+	natsDefaultFlush      = 5 * time.Second
+	natsDefaultAckWait    = 30 * time.Second
+	natsDefaultDeadLetter = "dead"
+	natsDefaultMaxDeliver = 0
+	natsDefaultRetryDelay = time.Duration(0)
 )
 
 func init() {
@@ -51,14 +63,30 @@ type (
 		Password   string
 		Stream     string
 		QueueGroup string
+		Timeout    time.Duration
+		Flush      time.Duration
+		AckWait    time.Duration
+		MaxDeliver int
+		RetryDelay time.Duration
+		DeadLetter string
+	}
+
+	syncInstance interface {
+		ServeSync(string, []byte) bool
 	}
 )
 
 func parseSetting(inst *event.Instance) natsSetting {
 	cfg := inst.Config.Setting
 	setting := natsSetting{
-		URL:    nats.DefaultURL,
-		Stream: "INFRAGOE",
+		URL:        nats.DefaultURL,
+		Stream:     "INFRAGOE",
+		Timeout:    natsDefaultTimeout,
+		Flush:      natsDefaultFlush,
+		AckWait:    natsDefaultAckWait,
+		MaxDeliver: natsDefaultMaxDeliver,
+		RetryDelay: natsDefaultRetryDelay,
+		DeadLetter: natsDefaultDeadLetter,
 	}
 
 	if v, ok := cfg["url"].(string); ok && v != "" {
@@ -88,6 +116,12 @@ func parseSetting(inst *event.Instance) natsSetting {
 	if v, ok := cfg["group"].(string); ok && v != "" {
 		setting.QueueGroup = v
 	}
+	setting.Timeout = durationSetting(cfg, "timeout", setting.Timeout)
+	setting.Flush = durationSetting(cfg, "flush_timeout", setting.Flush)
+	setting.AckWait = durationSetting(cfg, "ack_wait", setting.AckWait)
+	setting.MaxDeliver = intSetting(cfg, "max_deliver", setting.MaxDeliver)
+	setting.RetryDelay = durationSetting(cfg, "retry_delay", setting.RetryDelay)
+	setting.DeadLetter = stringSetting(cfg, "dead_letter", setting.DeadLetter)
 
 	return setting
 }
@@ -99,6 +133,9 @@ func connectNats(setting natsSetting) (*nats.Conn, error) {
 	}
 	if setting.Username != "" || setting.Password != "" {
 		opts = append(opts, nats.UserInfo(setting.Username, setting.Password))
+	}
+	if setting.Timeout > 0 {
+		opts = append(opts, nats.Timeout(setting.Timeout))
 	}
 	return nats.Connect(setting.URL, opts...)
 }
@@ -122,6 +159,7 @@ func (c *natsConnection) Open() error {
 }
 
 func (c *natsConnection) Close() error {
+	_ = c.Stop()
 	if c.client != nil {
 		c.client.Close()
 	}
@@ -170,6 +208,9 @@ func (c *natsConnection) Start() error {
 		}
 		c.subs = append(c.subs, sub)
 	}
+	if err := c.client.FlushTimeout(c.setting.Flush); err != nil {
+		return err
+	}
 	c.running = true
 	return nil
 }
@@ -192,8 +233,12 @@ func (c *natsConnection) Publish(name string, data []byte) error {
 	if err := c.client.Publish(name, data); err != nil {
 		return err
 	}
-	c.client.Flush()
-	return c.client.LastError()
+	err := c.client.FlushTimeout(c.setting.Flush)
+	if err == nil {
+		err = c.client.LastError()
+	}
+	traceEvent("publish", name, err, map[string]any{"driver": "nats"})
+	return err
 }
 
 func (d *natsJSDriver) Connect(inst *event.Instance) (event.Connection, error) {
@@ -217,7 +262,7 @@ func (c *natsJSConnection) Open() error {
 		return err
 	}
 
-	_, err = js.StreamInfo(c.setting.Stream)
+	info, err := js.StreamInfo(c.setting.Stream)
 	if err != nil {
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name:     c.setting.Stream,
@@ -226,12 +271,19 @@ func (c *natsJSConnection) Open() error {
 		if err != nil {
 			return err
 		}
+	} else if !streamHasSubject(info.Config.Subjects, c.setting.Stream+".*") {
+		cfg := info.Config
+		cfg.Subjects = append(cfg.Subjects, c.setting.Stream+".*")
+		if _, err := js.UpdateStream(&cfg); err != nil {
+			return err
+		}
 	}
 	c.stream = js
 	return nil
 }
 
 func (c *natsJSConnection) Close() error {
+	_ = c.Stop()
 	if c.client != nil {
 		c.client.Close()
 	}
@@ -254,6 +306,13 @@ func (c *natsJSConnection) Start() error {
 
 	for eventName, group := range c.events {
 		subject := jsSubject(c.setting.Stream, eventName)
+		opts := []nats.SubOpt{nats.DeliverNew(), nats.ManualAck()}
+		if c.setting.AckWait > 0 {
+			opts = append(opts, nats.AckWait(c.setting.AckWait))
+		}
+		if c.setting.MaxDeliver > 0 {
+			opts = append(opts, nats.MaxDeliver(c.setting.MaxDeliver))
+		}
 		var (
 			sub *nats.Subscription
 			err error
@@ -261,21 +320,34 @@ func (c *natsJSConnection) Start() error {
 		if group == "" {
 			sub, err = c.stream.Subscribe(subject, func(msg *nats.Msg) {
 				c.instance.Submit(func() {
-					c.instance.Serve(eventName, msg.Data)
+					if serveEvent(c.instance, eventName, msg.Data) {
+						_ = msg.Ack()
+						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject})
+					} else {
+						c.handleFailedMessage(eventName, msg)
+					}
 				})
-			}, nats.DeliverNew())
+			}, opts...)
 		} else {
 			consumer := jsConsumer(c.setting.Stream, eventName, group)
 			sub, err = c.stream.QueueSubscribe(subject, consumer, func(msg *nats.Msg) {
 				c.instance.Submit(func() {
-					c.instance.Serve(eventName, msg.Data)
+					if serveEvent(c.instance, eventName, msg.Data) {
+						_ = msg.Ack()
+						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject, "consumer": consumer})
+					} else {
+						c.handleFailedMessage(eventName, msg)
+					}
 				})
-			}, nats.Durable(consumer), nats.DeliverNew())
+			}, append(opts, nats.Durable(consumer))...)
 		}
 		if err != nil {
 			return err
 		}
 		c.subs = append(c.subs, sub)
+	}
+	if err := c.client.FlushTimeout(c.setting.Flush); err != nil {
+		return err
 	}
 	c.running = true
 	return nil
@@ -297,12 +369,51 @@ func (c *natsJSConnection) Stop() error {
 
 func (c *natsJSConnection) Publish(name string, data []byte) error {
 	_, err := c.stream.Publish(jsSubject(c.setting.Stream, name), data)
+	traceEvent("publish", name, err, map[string]any{"driver": "natsjs", "subject": jsSubject(c.setting.Stream, name)})
 	return err
 }
 
 func jsSubject(stream, name string) string {
-	name = strings.ReplaceAll(name, ".", "_")
+	name = base64.RawURLEncoding.EncodeToString([]byte(name))
 	return fmt.Sprintf("%s.%s", stream, name)
+}
+
+func (c *natsJSConnection) handleFailedMessage(eventName string, msg *nats.Msg) {
+	delivered := uint64(1)
+	if meta, err := msg.Metadata(); err == nil && meta != nil {
+		delivered = meta.NumDelivered
+	}
+	if c.setting.MaxDeliver > 0 && delivered >= uint64(c.setting.MaxDeliver) && c.setting.DeadLetter != "" {
+		_, err := c.stream.Publish(jsSubject(c.setting.Stream, deadLetterSubject(c.setting.DeadLetter, eventName)), msg.Data)
+		traceEvent("dead_letter", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered})
+		if err == nil {
+			_ = msg.Term()
+			return
+		}
+	}
+	var err error
+	if c.setting.RetryDelay > 0 {
+		err = msg.NakWithDelay(c.setting.RetryDelay)
+	} else {
+		err = msg.Nak()
+	}
+	traceEvent("nak", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered})
+}
+
+func deadLetterSubject(prefix, subject string) string {
+	if strings.Contains(prefix, "{subject}") {
+		return strings.ReplaceAll(prefix, "{subject}", subject)
+	}
+	return strings.TrimRight(prefix, ".") + "." + subject
+}
+
+func streamHasSubject(subjects []string, subject string) bool {
+	for _, item := range subjects {
+		if item == subject {
+			return true
+		}
+	}
+	return false
 }
 
 func jsConsumer(stream, name, group string) string {
@@ -313,6 +424,94 @@ func jsConsumer(stream, name, group string) string {
 		group = "all"
 	}
 	return name + "_" + group
+}
+
+func serveEvent(inst *event.Instance, name string, data []byte) bool {
+	if inst == nil {
+		return false
+	}
+	syncInst, ok := any(inst).(syncInstance)
+	if !ok {
+		return false
+	}
+	return syncInst.ServeSync(name, data)
+}
+
+func traceEvent(operation, name string, err error, attrs map[string]any) {
+	if attrs == nil {
+		attrs = map[string]any{}
+	}
+	attrs["module"] = "event"
+	attrs["operation"] = operation
+	if err != nil {
+		attrs["status"] = "error"
+		attrs["error"] = err.Error()
+	} else {
+		attrs["status"] = "ok"
+	}
+	_ = infra.NewMeta().Trace("event:"+name, infra.TraceAttrs("infrago", infra.TraceKindEvent, name, attrs))
+}
+
+func durationSetting(setting map[string]any, key string, def time.Duration) time.Duration {
+	switch v := setting[key].(type) {
+	case time.Duration:
+		if v >= 0 {
+			return v
+		}
+	case int:
+		if v >= 0 {
+			return time.Duration(v) * time.Second
+		}
+	case int64:
+		if v >= 0 {
+			return time.Duration(v) * time.Second
+		}
+	case float64:
+		if v >= 0 {
+			return time.Duration(v * float64(time.Second))
+		}
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return def
+		}
+		if d, err := time.ParseDuration(text); err == nil && d >= 0 {
+			return d
+		}
+		if n, err := strconv.Atoi(text); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
+
+func intSetting(setting map[string]any, key string, def int) int {
+	switch v := setting[key].(type) {
+	case int:
+		if v >= 0 {
+			return v
+		}
+	case int64:
+		if v >= 0 {
+			return int(v)
+		}
+	case float64:
+		if v >= 0 {
+			return int(v)
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func stringSetting(setting map[string]any, key, def string) string {
+	if v, ok := setting[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return def
 }
 
 var _ event.Connection = (*natsConnection)(nil)
