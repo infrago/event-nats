@@ -2,6 +2,7 @@ package event_nats
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -73,6 +74,16 @@ type (
 
 	syncInstance interface {
 		ServeSync(string, []byte) bool
+	}
+
+	deadLetterEnvelope struct {
+		Data     []byte `json:"data"`
+		Subject  string `json:"subject"`
+		Source   string `json:"source"`
+		Message  uint64 `json:"message"`
+		Attempt  uint64 `json:"attempt"`
+		Driver   string `json:"driver"`
+		Datetime int64  `json:"datetime"`
 	}
 )
 
@@ -231,13 +242,14 @@ func (c *natsConnection) Stop() error {
 
 func (c *natsConnection) Publish(name string, data []byte) error {
 	if err := c.client.Publish(name, data); err != nil {
+		traceEvent("publish", name, err, map[string]any{"driver": "nats", "bytes": len(data), "reliable": false})
 		return err
 	}
 	err := c.client.FlushTimeout(c.setting.Flush)
 	if err == nil {
 		err = c.client.LastError()
 	}
-	traceEvent("publish", name, err, map[string]any{"driver": "nats"})
+	traceEvent("publish", name, err, map[string]any{"driver": "nats", "bytes": len(data), "reliable": false})
 	return err
 }
 
@@ -322,7 +334,7 @@ func (c *natsJSConnection) Start() error {
 				c.instance.Submit(func() {
 					if serveEvent(c.instance, eventName, msg.Data) {
 						_ = msg.Ack()
-						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject})
+						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject, "attempt": messageAttempt(msg), "bytes": len(msg.Data)})
 					} else {
 						c.handleFailedMessage(eventName, msg)
 					}
@@ -330,16 +342,17 @@ func (c *natsJSConnection) Start() error {
 			}, opts...)
 		} else {
 			consumer := jsConsumer(c.setting.Stream, eventName, group)
-			sub, err = c.stream.QueueSubscribe(subject, consumer, func(msg *nats.Msg) {
+			handler := func(msg *nats.Msg) {
 				c.instance.Submit(func() {
 					if serveEvent(c.instance, eventName, msg.Data) {
 						_ = msg.Ack()
-						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject, "consumer": consumer})
+						traceEvent("ack", eventName, nil, map[string]any{"driver": "natsjs", "subject": subject, "consumer": consumer, "attempt": messageAttempt(msg), "bytes": len(msg.Data)})
 					} else {
 						c.handleFailedMessage(eventName, msg)
 					}
 				})
-			}, append(opts, nats.Durable(consumer))...)
+			}
+			sub, err = c.queueSubscribe(subject, consumer, handler, opts...)
 		}
 		if err != nil {
 			return err
@@ -369,8 +382,21 @@ func (c *natsJSConnection) Stop() error {
 
 func (c *natsJSConnection) Publish(name string, data []byte) error {
 	_, err := c.stream.Publish(jsSubject(c.setting.Stream, name), data)
-	traceEvent("publish", name, err, map[string]any{"driver": "natsjs", "subject": jsSubject(c.setting.Stream, name)})
+	traceEvent("publish", name, err, map[string]any{"driver": "natsjs", "subject": jsSubject(c.setting.Stream, name), "bytes": len(data), "reliable": true})
 	return err
+}
+
+func (c *natsJSConnection) queueSubscribe(subject, consumer string, handler nats.MsgHandler, opts ...nats.SubOpt) (*nats.Subscription, error) {
+	sub, err := c.stream.QueueSubscribe(subject, consumer, handler, append(opts, nats.Durable(consumer))...)
+	if err == nil || !isDurableConfigError(err) {
+		return sub, err
+	}
+	if delErr := c.stream.DeleteConsumer(c.setting.Stream, consumer); delErr != nil {
+		traceEvent("consumer_delete", subject, delErr, map[string]any{"driver": "natsjs", "consumer": consumer})
+		return sub, err
+	}
+	traceEvent("consumer_delete", subject, nil, map[string]any{"driver": "natsjs", "consumer": consumer})
+	return c.stream.QueueSubscribe(subject, consumer, handler, append(opts, nats.Durable(consumer))...)
 }
 
 func jsSubject(stream, name string) string {
@@ -380,12 +406,25 @@ func jsSubject(stream, name string) string {
 
 func (c *natsJSConnection) handleFailedMessage(eventName string, msg *nats.Msg) {
 	delivered := uint64(1)
+	streamSeq := uint64(0)
 	if meta, err := msg.Metadata(); err == nil && meta != nil {
 		delivered = meta.NumDelivered
+		streamSeq = meta.Sequence.Stream
 	}
 	if c.setting.MaxDeliver > 0 && delivered >= uint64(c.setting.MaxDeliver) && c.setting.DeadLetter != "" {
-		_, err := c.stream.Publish(jsSubject(c.setting.Stream, deadLetterSubject(c.setting.DeadLetter, eventName)), msg.Data)
-		traceEvent("dead_letter", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered})
+		payload, err := json.Marshal(deadLetterEnvelope{
+			Data:     msg.Data,
+			Subject:  eventName,
+			Source:   msg.Subject,
+			Message:  streamSeq,
+			Attempt:  delivered,
+			Driver:   "natsjs",
+			Datetime: time.Now().Unix(),
+		})
+		if err == nil {
+			_, err = c.stream.Publish(jsSubject(c.setting.Stream, deadLetterSubject(c.setting.DeadLetter, eventName)), payload)
+		}
+		traceEvent("dead_letter", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered, "bytes": len(msg.Data)})
 		if err == nil {
 			_ = msg.Term()
 			return
@@ -397,7 +436,25 @@ func (c *natsJSConnection) handleFailedMessage(eventName string, msg *nats.Msg) 
 	} else {
 		err = msg.Nak()
 	}
-	traceEvent("nak", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered})
+	traceEvent("nak", eventName, err, map[string]any{"driver": "natsjs", "attempt": delivered, "bytes": len(msg.Data)})
+}
+
+func messageAttempt(msg *nats.Msg) uint64 {
+	if msg == nil {
+		return 1
+	}
+	if meta, err := msg.Metadata(); err == nil && meta != nil && meta.NumDelivered > 0 {
+		return meta.NumDelivered
+	}
+	return 1
+}
+
+func isDurableConfigError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "consumer") && (strings.Contains(msg, "configuration") || strings.Contains(msg, "config"))
 }
 
 func deadLetterSubject(prefix, subject string) string {

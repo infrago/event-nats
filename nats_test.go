@@ -1,6 +1,7 @@
 package event_nats
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -60,3 +61,39 @@ func TestParseNatsSetting(t *testing.T) {
 		t.Fatalf("unexpected dead letter subject %q", got)
 	}
 }
+
+func TestNatsDeadLetterEnvelopeSchema(t *testing.T) {
+	payload, err := json.Marshal(deadLetterEnvelope{
+		Data:     []byte("body"),
+		Subject:  "user.created",
+		Source:   "EVENTS.abc",
+		Message:  10,
+		Attempt:  3,
+		Driver:   "natsjs",
+		Datetime: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var out deadLetterEnvelope
+	if err := json.Unmarshal(payload, &out); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if string(out.Data) != "body" || out.Subject != "user.created" || out.Attempt != 3 {
+		t.Fatalf("unexpected envelope: %+v", out)
+	}
+}
+
+func TestIsDurableConfigError(t *testing.T) {
+	if !isDurableConfigError(natsError("consumer configuration mismatch")) {
+		t.Fatal("expected durable config error")
+	}
+	if isDurableConfigError(natsError("authorization violation")) {
+		t.Fatal("unexpected durable config error")
+	}
+}
+
+type natsError string
+
+func (err natsError) Error() string { return string(err) }
